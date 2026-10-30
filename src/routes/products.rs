@@ -46,10 +46,10 @@ struct ProductRow {
 
 const STORE_ON_HAND_SQL: &str = "COALESCE((SELECT SUM(b.on_hand) FROM inventory_balances b
          INNER JOIN stock_locations sl ON sl.id = b.stock_location_id AND sl.kind = 'store'
-         WHERE b.product_id = p.id), 0)";
+         WHERE b.product_id = p.id AND b.product_variant_id IS NULL), 0)";
 const WAREHOUSE_ON_HAND_SQL: &str = "COALESCE((SELECT SUM(b.on_hand) FROM inventory_balances b
          INNER JOIN stock_locations sl ON sl.id = b.stock_location_id AND sl.kind = 'warehouse'
-         WHERE b.product_id = p.id), 0)";
+         WHERE b.product_id = p.id AND b.product_variant_id IS NULL), 0)";
 pub async fn index(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -73,12 +73,15 @@ pub async fn index(
     );
     let mut binds: Vec<String> = vec![];
     if let Some(q) = query.q.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        sql.push_str(" AND (p.name LIKE ? OR p.sku LIKE ? OR IFNULL(p.barcode,'') LIKE ?)");
+        sql.push_str(" AND (p.name LIKE ? OR p.sku LIKE ? OR IFNULL(p.barcode,'') LIKE ? OR EXISTS (SELECT 1 FROM product_barcodes pb WHERE pb.product_id = p.id AND pb.active = 1 AND (pb.barcode LIKE ? OR IFNULL(pb.description,'') LIKE ?)))");
         let like = format!("%{q}%");
+        binds.push(like.clone());
+        binds.push(like.clone());
         binds.push(like.clone());
         binds.push(like.clone());
         binds.push(like);
     }
+    sql.push_str(" AND IFNULL(p.status, 'active') = 'active'");
     // Stock alerts / filters — store is sellable; warehouse filters for Alerts desk.
     // Thresholds are i64 from meta (safe to interpolate).
     match query.stock.as_deref() {
@@ -226,6 +229,10 @@ pub async fn create(
         .execute(&mut *tx)
         .await?;
     }
+    let barcode_drafts = parse_barcode_drafts(fields.get("barcodes").map(String::as_str), draft.barcode.as_deref());
+    if !barcode_drafts.is_empty() {
+        replace_barcodes_tx(&mut tx, id, &barcode_drafts).await?;
+    }
     outbox::enqueue(&mut tx, "product.created", json!({ "product_id": id })).await?;
     tx.commit().await?;
     activity::log(
@@ -242,6 +249,188 @@ pub async fn create(
     ))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LookupQuery {
+    pub barcode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MergeBody {
+    pub primary_id: i64,
+    pub source_ids: Vec<i64>,
+}
+
+pub async fn lookup(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Query(query): Query<LookupQuery>,
+) -> AppResult<Json<Value>> {
+    if !auth.allow("products.view") && !auth.allow("sales") && !auth.allow("barcodes.view") {
+        return Err(AppError::forbidden("You do not have access to that."));
+    }
+    let code = normalize_barcode(query.barcode.as_deref().unwrap_or(""));
+    if code.is_empty() {
+        return Err(AppError::bad("Scan or enter a barcode."));
+    }
+    #[derive(FromRow)]
+    struct Hit {
+        product_id: i64,
+        product_variant_id: Option<i64>,
+        barcode: String,
+        description: Option<String>,
+        is_primary: i64,
+    }
+    let hit = sqlx::query_as::<_, Hit>(
+        "SELECT product_id, product_variant_id, barcode, description, is_primary
+         FROM product_barcodes WHERE barcode = ? AND active = 1 LIMIT 1",
+    )
+    .bind(&code)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("No product matches that barcode.".into()))?;
+    let status: Option<String> =
+        sqlx::query_scalar("SELECT IFNULL(status, 'active') FROM products WHERE id = ?")
+            .bind(hit.product_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    if status.as_deref() != Some("active") {
+        return Err(AppError::NotFound("No product matches that barcode.".into()));
+    }
+    let product = product_payload(&state, hit.product_id).await?;
+    let variant = if let Some(vid) = hit.product_variant_id {
+        variant_payload(&state, hit.product_id, vid).await?
+    } else {
+        Value::Null
+    };
+    Ok(Json(json!({
+        "product": product,
+        "variant": variant,
+        "barcode": {
+            "barcode": hit.barcode,
+            "description": hit.description,
+            "is_primary": hit.is_primary != 0,
+            "product_variant_id": hit.product_variant_id,
+        }
+    })))
+}
+
+pub async fn merge(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<MergeBody>,
+) -> AppResult<Json<Value>> {
+    auth.require("products.merge")?;
+    let primary = body.primary_id;
+    let sources: Vec<i64> = body
+        .source_ids
+        .into_iter()
+        .filter(|id| *id != primary)
+        .collect();
+    if sources.is_empty() {
+        return Err(AppError::bad("Choose at least one product to merge."));
+    }
+    let primary_variants: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM product_variants WHERE product_id = ? AND active = 1",
+    )
+    .bind(primary)
+    .fetch_one(&state.pool)
+    .await?;
+    if primary_variants > 0 {
+        return Err(AppError::bad("Merge only works for products without variants."));
+    }
+    for sid in &sources {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_variants WHERE product_id = ? AND active = 1",
+        )
+        .bind(sid)
+        .fetch_one(&state.pool)
+        .await?;
+        if n > 0 {
+            return Err(AppError::bad("Merge only works for products without variants."));
+        }
+    }
+    let store_id = db::store_location_id(&state.pool).await?;
+    let mut tx = state.pool.begin().await?;
+    for sid in &sources {
+        sqlx::query("UPDATE product_barcodes SET product_id = ?, product_variant_id = NULL WHERE product_id = ? AND active = 1")
+            .bind(primary)
+            .bind(sid)
+            .execute(&mut *tx)
+            .await?;
+        let rows = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT id, stock_location_id, on_hand FROM inventory_balances
+             WHERE product_id = ? AND product_variant_id IS NULL AND on_hand > 0",
+        )
+        .bind(sid)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (_bid, location_id, on_hand) in rows {
+            let reserved: i64 = sqlx::query_scalar(
+                "SELECT reserved FROM inventory_balances WHERE product_id = ? AND stock_location_id = ? AND product_variant_id IS NULL",
+            )
+            .bind(sid)
+            .bind(location_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap_or(0);
+            if reserved > 0 {
+                return Err(AppError::bad("A source product still has reserved stock."));
+            }
+            sqlx::query(
+                "UPDATE inventory_balances SET on_hand = 0 WHERE product_id = ? AND stock_location_id = ? AND product_variant_id IS NULL",
+            )
+            .bind(sid)
+            .bind(location_id)
+            .execute(&mut *tx)
+            .await?;
+            let existing: Option<i64> = sqlx::query_scalar(
+                "SELECT on_hand FROM inventory_balances WHERE product_id = ? AND stock_location_id = ? AND product_variant_id IS NULL",
+            )
+            .bind(primary)
+            .bind(location_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(cur) = existing {
+                sqlx::query(
+                    "UPDATE inventory_balances SET on_hand = ? WHERE product_id = ? AND stock_location_id = ? AND product_variant_id IS NULL",
+                )
+                .bind(cur + on_hand)
+                .bind(primary)
+                .bind(location_id)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                let branch_id = default_branch_id(&state).await?;
+                sqlx::query(
+                    "INSERT INTO inventory_balances(product_id, branch_id, stock_location_id, on_hand, reserved, product_variant_id)
+                     VALUES(?, ?, ?, ?, 0, NULL)",
+                )
+                .bind(primary)
+                .bind(branch_id)
+                .bind(location_id)
+                .bind(on_hand)
+                .execute(&mut *tx)
+                .await?;
+            }
+            let _ = store_id;
+        }
+        sqlx::query("UPDATE products SET status = 'archived', updated_at = datetime('now') WHERE id = ?")
+            .bind(sid)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    activity::log(
+        &state,
+        &auth,
+        "product.merged",
+        format!("{} merged products into #{}", auth.user.name, primary),
+        Some(json!({ "primary_id": primary, "source_ids": sources })),
+    )
+    .await;
+    Ok(Json(json!({ "product": product_payload(&state, primary).await? })))
+}
+
 pub async fn update(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -252,6 +441,7 @@ pub async fn update(
     let _ = load_row(&state, id).await?;
     let fields = read_multipart(multipart).await?;
     let draft = draft_from_fields(&fields, &state).await?;
+    let mut tx = state.pool.begin().await?;
     sqlx::query(
         "UPDATE products SET category_id = ?, name = ?, sku = ?, barcode = ?, description = ?,
          purchase_price = ?, selling_price = ?, reorder_level = ?, featured = ?, updated_at = datetime('now')
@@ -267,8 +457,14 @@ pub async fn update(
     .bind(draft.reorder_level)
     .bind(i64::from(draft.featured))
     .bind(id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
+    if fields.contains_key("barcodes") || draft.barcode.is_some() {
+        let barcode_drafts = parse_barcode_drafts(fields.get("barcodes").map(String::as_str), draft.barcode.as_deref());
+        replace_barcodes_tx(&mut tx, id, &barcode_drafts).await?;
+    }
+    outbox::enqueue(&mut tx, "product.updated", json!({ "product_id": id })).await?;
+    tx.commit().await?;
     activity::log(
         &state,
         &auth,
@@ -438,6 +634,8 @@ pub async fn import(
     let name_i = idx(&["name", "product", "product name"]).unwrap_or(0);
     let sku_i = idx(&["sku", "code"]);
     let barcode_i = idx(&["barcode", "ean", "upc"]);
+    let barcodes_i = idx(&["barcodes"]);
+    let barcode_desc_i = idx(&["barcode_descriptions", "barcode_labels"]);
     let purchase_i = idx(&["purchase_price", "cost", "buy"]);
     let sell_i = idx(&["selling_price", "price", "sell"]);
     let qty_i = idx(&["stock_quantity", "quantity", "qty", "stock"]);
@@ -467,7 +665,28 @@ pub async fn import(
                 }
             },
         };
-        let barcode = barcode_i.and_then(|i| cells.get(i).map(|s| s.trim().to_string())).filter(|s| !s.is_empty());
+        let mut codes: Vec<String> = Vec::new();
+        if let Some(code) = barcode_i
+            .and_then(|i| cells.get(i).map(|s| normalize_barcode(s)))
+            .filter(|s| !s.is_empty())
+        {
+            codes.push(code);
+        }
+        if let Some(i) = barcodes_i {
+            for part in cells.get(i).map(|s| s.as_str()).unwrap_or("").split(|c| c == '|' || c == ';') {
+                let code = normalize_barcode(part);
+                if !code.is_empty() && !codes.iter().any(|c| c == &code) {
+                    codes.push(code);
+                }
+            }
+        }
+        let descriptions: Vec<String> = barcode_desc_i
+            .and_then(|i| cells.get(i).cloned())
+            .unwrap_or_default()
+            .split(|c| c == '|' || c == ';')
+            .map(|s| s.trim().to_string())
+            .collect();
+        let barcode = codes.first().cloned();
         let purchase = purchase_i
             .and_then(|i| cells.get(i).map(|s| s.trim().to_string()))
             .unwrap_or_else(|| "0".into());
@@ -524,6 +743,21 @@ pub async fn import(
             continue;
         };
         let id = result.last_insert_rowid();
+        let drafts: Vec<BarcodeDraft> = codes
+            .into_iter()
+            .enumerate()
+            .map(|(index, code)| BarcodeDraft {
+                barcode: code,
+                description: descriptions.get(index).cloned().filter(|s| !s.is_empty()),
+                is_primary: index == 0,
+                product_variant_id: None,
+            })
+            .collect();
+        if let Err(e) = replace_barcodes_tx(&mut tx, id, &drafts).await {
+            let _ = tx.rollback().await;
+            failed.push(json!({ "row": row_num, "error": e.to_string() }));
+            continue;
+        }
         if qty > 0 {
             let _ = sqlx::query(
                 "INSERT INTO inventory_balances(product_id, branch_id, stock_location_id, on_hand, reserved)
@@ -750,7 +984,213 @@ async fn product_payload(state: &AppState, id: i64) -> AppResult<Value> {
     let row = load_row(state, id).await?;
     let store_id = db::store_location_id(&state.pool).await?;
     let warehouse_id = db::warehouse_location_id(&state.pool).await?;
-    Ok(product_json(&row, store_id, warehouse_id))
+    let mut payload = product_json(&row, store_id, warehouse_id);
+    let barcodes = load_barcodes(state, id).await?;
+    let variants = load_variants(state, id).await?;
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("barcodes".into(), barcodes);
+        obj.insert("variants".into(), variants);
+        obj.insert("status".into(), json!("active"));
+    }
+    Ok(payload)
+}
+
+async fn load_barcodes(state: &AppState, product_id: i64) -> AppResult<Value> {
+    #[derive(FromRow)]
+    struct Row {
+        id: i64,
+        barcode: String,
+        description: Option<String>,
+        barcode_type: Option<String>,
+        is_primary: i64,
+        product_variant_id: Option<i64>,
+        active: i64,
+    }
+    let rows = sqlx::query_as::<_, Row>(
+        "SELECT id, barcode, description, barcode_type, is_primary, product_variant_id, active
+         FROM product_barcodes WHERE product_id = ? AND active = 1 ORDER BY is_primary DESC, id",
+    )
+    .bind(product_id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Value::Array(
+        rows.into_iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "barcode": r.barcode,
+                    "description": r.description,
+                    "barcode_type": r.barcode_type,
+                    "is_primary": r.is_primary != 0,
+                    "product_variant_id": r.product_variant_id,
+                    "active": r.active != 0,
+                })
+            })
+            .collect(),
+    ))
+}
+
+async fn load_variants(state: &AppState, product_id: i64) -> AppResult<Value> {
+    #[derive(FromRow)]
+    struct Row {
+        id: i64,
+        name: String,
+        sku: String,
+        selling_price: String,
+        purchase_price: String,
+        active: i64,
+        on_hand: i64,
+    }
+    let rows = sqlx::query_as::<_, Row>(
+        "SELECT v.id, v.name, v.sku, v.selling_price, v.purchase_price, v.active,
+                COALESCE((SELECT SUM(b.on_hand) FROM inventory_balances b
+                  INNER JOIN stock_locations sl ON sl.id = b.stock_location_id AND sl.kind = 'store'
+                  WHERE b.product_variant_id = v.id), 0) AS on_hand
+         FROM product_variants v WHERE v.product_id = ? AND v.active = 1 ORDER BY v.id",
+    )
+    .bind(product_id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Value::Array(
+        rows.into_iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "name": r.name,
+                    "sku": r.sku,
+                    "selling_price": r.selling_price,
+                    "purchase_price": r.purchase_price,
+                    "active": r.active != 0,
+                    "stock_quantity": r.on_hand,
+                    "store_on_hand": r.on_hand,
+                    "warehouse_on_hand": 0,
+                })
+            })
+            .collect(),
+    ))
+}
+
+async fn variant_payload(state: &AppState, product_id: i64, variant_id: i64) -> AppResult<Value> {
+    let variants = load_variants(state, product_id).await?;
+    Ok(variants
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row.get("id").and_then(|v| v.as_i64()) == Some(variant_id)))
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+struct BarcodeDraft {
+    barcode: String,
+    description: Option<String>,
+    is_primary: bool,
+    product_variant_id: Option<i64>,
+}
+
+fn normalize_barcode(value: &str) -> String {
+    value.trim().to_string()
+}
+
+fn parse_barcode_drafts(raw: Option<&str>, fallback: Option<&str>) -> Vec<BarcodeDraft> {
+    if let Some(text) = raw.filter(|s| !s.trim().is_empty()) {
+        if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(text) {
+            let mut rows = Vec::new();
+            for (index, item) in items.iter().enumerate() {
+                let code = item
+                    .get("barcode")
+                    .and_then(|v| v.as_str())
+                    .map(normalize_barcode)
+                    .unwrap_or_default();
+                if code.is_empty() {
+                    continue;
+                }
+                rows.push(BarcodeDraft {
+                    barcode: code,
+                    description: item
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                    is_primary: item
+                        .get("is_primary")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(index == 0),
+                    product_variant_id: item.get("product_variant_id").and_then(|v| v.as_i64()),
+                });
+            }
+            if !rows.is_empty() {
+                if !rows.iter().any(|row| row.is_primary) {
+                    rows[0].is_primary = true;
+                }
+                return rows;
+            }
+        }
+    }
+    fallback
+        .map(normalize_barcode)
+        .filter(|s| !s.is_empty())
+        .map(|barcode| {
+            vec![BarcodeDraft {
+                barcode,
+                description: None,
+                is_primary: true,
+                product_variant_id: None,
+            }]
+        })
+        .unwrap_or_default()
+}
+
+async fn replace_barcodes_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    product_id: i64,
+    rows: &[BarcodeDraft],
+) -> AppResult<()> {
+    sqlx::query("UPDATE product_barcodes SET active = 0, is_primary = 0 WHERE product_id = ?")
+        .bind(product_id)
+        .execute(&mut **tx)
+        .await?;
+    for (index, row) in rows.iter().enumerate() {
+        let code = normalize_barcode(&row.barcode);
+        if code.is_empty() {
+            continue;
+        }
+        let conflict: Option<i64> = sqlx::query_scalar(
+            "SELECT product_id FROM product_barcodes WHERE barcode = ? AND active = 1 AND product_id != ? LIMIT 1",
+        )
+        .bind(&code)
+        .bind(product_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if conflict.is_some() {
+            return Err(AppError::bad(format!(
+                "Barcode {code} is already on another product."
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO product_barcodes(product_id, product_variant_id, barcode, description, is_primary, active)
+             VALUES(?, ?, ?, ?, ?, 1)",
+        )
+        .bind(product_id)
+        .bind(row.product_variant_id)
+        .bind(&code)
+        .bind(&row.description)
+        .bind(i64::from(row.is_primary || index == 0))
+        .execute(&mut **tx)
+        .await?;
+    }
+    let primary: Option<String> = sqlx::query_scalar(
+        "SELECT barcode FROM product_barcodes WHERE product_id = ? AND active = 1 ORDER BY is_primary DESC, id LIMIT 1",
+    )
+    .bind(product_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(code) = primary {
+        sqlx::query("UPDATE products SET barcode = ? WHERE id = ?")
+            .bind(code)
+            .bind(product_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(())
 }
 
 fn product_json(row: &ProductRow, store_id: i64, warehouse_id: i64) -> Value {
@@ -769,6 +1209,8 @@ fn product_json(row: &ProductRow, store_id: i64, warehouse_id: i64) -> Value {
         "reorder_level": row.reorder_level,
         "featured": row.featured != 0,
         "images": [],
+        "barcodes": [],
+        "variants": [],
         "balances": [
             {
                 "stock_location_id": store_id,

@@ -43,6 +43,8 @@ pub struct CreateSale {
 pub struct SaleItemIn {
     pub product_id: i64,
     pub quantity: i64,
+    #[serde(default)]
+    pub product_variant_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -241,17 +243,47 @@ pub async fn create(
         .bind(item.product_id)
         .fetch_optional(&state.pool)
         .await?;
-        let Some((id, name, sku, price_s)) = product else {
+        let Some((id, mut name, mut sku, mut price_s)) = product else {
             return Err(AppError::bad("A product in the cart is no longer on this register."));
         };
-        let on_hand: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(on_hand, 0) FROM inventory_balances WHERE product_id = ? AND stock_location_id = ?",
-        )
-        .bind(id)
-        .bind(store_location)
-        .fetch_optional(&state.pool)
-        .await?
-        .unwrap_or(0);
+        let variant_id = item.product_variant_id;
+        if let Some(vid) = variant_id {
+            let variant: Option<(String, String, String)> = sqlx::query_as(
+                "SELECT name, sku, selling_price FROM product_variants WHERE id = ? AND product_id = ? AND active = 1",
+            )
+            .bind(vid)
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?;
+            let Some((vname, vsku, vprice)) = variant else {
+                return Err(AppError::bad("A variant in the cart is no longer on this register."));
+            };
+            name = format!("{name} · {vname}");
+            sku = vsku;
+            price_s = vprice;
+        }
+        let on_hand: i64 = if let Some(vid) = variant_id {
+            sqlx::query_scalar(
+                "SELECT COALESCE(on_hand, 0) FROM inventory_balances
+                 WHERE product_id = ? AND stock_location_id = ? AND product_variant_id = ?",
+            )
+            .bind(id)
+            .bind(store_location)
+            .bind(vid)
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or(0)
+        } else {
+            sqlx::query_scalar(
+                "SELECT COALESCE(on_hand, 0) FROM inventory_balances
+                 WHERE product_id = ? AND stock_location_id = ? AND product_variant_id IS NULL",
+            )
+            .bind(id)
+            .bind(store_location)
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or(0)
+        };
         if on_hand < item.quantity {
             return Err(AppError::bad(format!(
                 "Not enough store stock for {name}. Transfer from warehouse first."
@@ -259,7 +291,7 @@ pub async fn create(
         }
         let unit: f64 = price_s.parse().unwrap_or(0.0);
         let line_total = (unit * item.quantity as f64 * 100.0).round() / 100.0;
-        built.push((id, name, sku, unit, item.quantity, line_total, store_location));
+        built.push((id, name, sku, unit, item.quantity, line_total, store_location, variant_id));
     }
 
     let subtotal: f64 = built.iter().map(|i| i.5).sum::<f64>();
@@ -323,13 +355,14 @@ pub async fn create(
     .await?;
     let sale_id = result.last_insert_rowid();
 
-    for (product_id, name, sku, unit, qty, line_total, sell_location) in &built {
+    for (product_id, name, sku, unit, qty, line_total, sell_location, variant_id) in &built {
         sqlx::query(
-            "INSERT INTO sale_items(sale_id, product_id, name, sku, unit_price, quantity, line_total)
-             VALUES(?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sale_items(sale_id, product_id, product_variant_id, name, sku, unit_price, quantity, line_total)
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(sale_id)
         .bind(product_id)
+        .bind(variant_id)
         .bind(name)
         .bind(sku)
         .bind(format!("{unit:.2}"))
@@ -338,30 +371,58 @@ pub async fn create(
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "UPDATE inventory_balances
-             SET on_hand = on_hand - ?
-             WHERE product_id = ? AND stock_location_id = ?",
-        )
-        .bind(qty)
-        .bind(product_id)
-        .bind(sell_location)
-        .execute(&mut *tx)
-        .await?;
+        if let Some(vid) = variant_id {
+            sqlx::query(
+                "UPDATE inventory_balances
+                 SET on_hand = on_hand - ?
+                 WHERE product_id = ? AND stock_location_id = ? AND product_variant_id = ?",
+            )
+            .bind(qty)
+            .bind(product_id)
+            .bind(sell_location)
+            .bind(vid)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE inventory_balances
+                 SET on_hand = on_hand - ?
+                 WHERE product_id = ? AND stock_location_id = ? AND product_variant_id IS NULL",
+            )
+            .bind(qty)
+            .bind(product_id)
+            .bind(sell_location)
+            .execute(&mut *tx)
+            .await?;
+        }
 
-        let after: i64 = sqlx::query_scalar(
-            "SELECT on_hand FROM inventory_balances WHERE product_id = ? AND stock_location_id = ?",
-        )
-        .bind(product_id)
-        .bind(sell_location)
-        .fetch_one(&mut *tx)
-        .await?;
+        let after: i64 = if let Some(vid) = variant_id {
+            sqlx::query_scalar(
+                "SELECT on_hand FROM inventory_balances
+                 WHERE product_id = ? AND stock_location_id = ? AND product_variant_id = ?",
+            )
+            .bind(product_id)
+            .bind(sell_location)
+            .bind(vid)
+            .fetch_one(&mut *tx)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT on_hand FROM inventory_balances
+                 WHERE product_id = ? AND stock_location_id = ? AND product_variant_id IS NULL",
+            )
+            .bind(product_id)
+            .bind(sell_location)
+            .fetch_one(&mut *tx)
+            .await?
+        };
 
         sqlx::query(
-            "INSERT INTO stock_movements(product_id, stock_location_id, branch_id, user_id, kind, quantity, balance_after, document_type, document_id)
-             VALUES(?, ?, ?, ?, 'sale', ?, ?, 'sale', ?)",
+            "INSERT INTO stock_movements(product_id, product_variant_id, stock_location_id, branch_id, user_id, kind, quantity, balance_after, document_type, document_id)
+             VALUES(?, ?, ?, ?, ?, 'sale', ?, ?, 'sale', ?)",
         )
         .bind(product_id)
+        .bind(variant_id)
         .bind(sell_location)
         .bind(branch_id)
         .bind(auth.user.id)
@@ -375,6 +436,7 @@ pub async fn create(
         let payload = json!({
             "sale_id": sale_id,
             "product_id": product_id,
+            "product_variant_id": variant_id,
             "quantity": qty,
             "receipt_number": receipt,
         });

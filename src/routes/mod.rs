@@ -56,6 +56,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/products/import", post(products::import))
         .route("/api/v1/products/alert_counts", get(products::alert_counts))
+        .route("/api/v1/products/lookup", get(products::lookup))
+        .route("/api/v1/products/merge", post(products::merge))
         .route(
             "/api/v1/products/{id}",
             get(products::show)
