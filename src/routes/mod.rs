@@ -67,6 +67,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/register_sessions",
             get(register::index).post(register::create),
         )
+        .route("/api/v1/register_sessions/drawer", post(register::drawer))
         .route("/api/v1/register_sessions/{id}/close", post(register::close))
         .route("/api/v1/sales", get(sales::index).post(sales::create))
         .route("/api/v1/sales/{id}", get(sales::show))

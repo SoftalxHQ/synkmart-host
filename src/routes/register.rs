@@ -44,6 +44,14 @@ pub struct CloseBody {
     pub notes: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DrawerBody {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub receipt_number: Option<String>,
+}
+
 pub async fn index(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json<Value>> {
     auth.require("sales")?;
     let rows = sqlx::query_as::<_, RegisterRow>(
@@ -213,6 +221,44 @@ pub async fn close(
     .await;
 
     Ok(Json(json!({ "register_session": session_json(&updated) })))
+}
+
+pub async fn drawer(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(body): Json<DrawerBody>,
+) -> AppResult<StatusCode> {
+    auth.require("sales")?;
+    let reason = match body.reason.as_deref().unwrap_or("manual") {
+        "sale" => "sale",
+        _ => "manual",
+    };
+    let receipt = body
+        .receipt_number
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let summary = match (reason, receipt) {
+        ("sale", Some(number)) => format!(
+            "{} opened the cash drawer for sale {}",
+            auth.user.name, number
+        ),
+        ("sale", None) => format!("{} opened the cash drawer for a sale", auth.user.name),
+        _ => format!("{} opened the cash drawer", auth.user.name),
+    };
+    activity::log(
+        &state,
+        &auth,
+        "register.drawer_opened",
+        summary,
+        Some(json!({
+            "reason": reason,
+            "receipt_number": receipt,
+            "cashier": auth.user.name,
+        })),
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn session_json(row: &RegisterRow) -> Value {
