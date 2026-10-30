@@ -36,6 +36,8 @@ pub struct CreateSale {
     #[serde(default)]
     pub customer_name: Option<String>,
     #[serde(default)]
+    pub customer_id: Option<i64>,
+    #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
@@ -216,6 +218,16 @@ pub async fn create(
         return Err(AppError::bad("Add a payment."));
     }
 
+    let settings = super::settings::effective_settings(&state).await?;
+    if settings
+        .pointer("/sales/require_customer")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && body.customer_id.is_none()
+    {
+        return Err(AppError::bad("Choose a customer for this sale."));
+    }
+
     // Cashiers sell only from store stock — warehouse must be transferred first.
     let store_location = db::store_location_id(&state.pool).await?;
     let branch_id = db::meta_get(&state.pool, "branch_id")
@@ -319,7 +331,8 @@ pub async fn create(
             return Err(AppError::bad("Payment amount must be greater than 0."));
         }
         let method = payment.method.trim().to_lowercase();
-        if !matches!(method.as_str(), "cash" | "card" | "transfer" | "credit") {
+        let allowed = super::settings::active_payment_codes(&state).await?;
+        if !allowed.iter().any(|code| code == &method) {
             return Err(AppError::bad("Unknown payment method."));
         }
         paid += amount;
@@ -550,6 +563,20 @@ pub async fn create_return(
     let items_in = body.items.unwrap_or_default();
     if items_in.is_empty() {
         return Err(AppError::bad("Select at least one item to return."));
+    }
+    let settings = super::settings::effective_settings(&state).await?;
+    if settings
+        .pointer("/sales/return_reason_required")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        && body
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+    {
+        return Err(AppError::bad("Give a reason for this return."));
     }
     let method = body
         .refund_method

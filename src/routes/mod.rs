@@ -10,6 +10,7 @@ mod promos;
 mod purchases;
 mod register;
 mod sales;
+mod settings;
 mod setup;
 mod staff;
 mod stock;
@@ -31,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .allow_headers(Any);
 
     Router::new()
+        .route("/", get(health::health))
         .route("/health", get(health::health))
         .route("/api/v1/setup/status", get(setup::status))
         .route("/api/v1/setup/local", post(setup::local_bootstrap))
@@ -41,6 +43,23 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/me", get(auth::me))
         .route("/api/v1/auth/lock", post(auth::lock))
         .route("/api/v1/merchant", get(merchant::show).patch(merchant::update))
+        .route("/api/v1/merchant/logo", get(merchant::show_logo))
+        .route(
+            "/api/v1/merchant/settings",
+            get(settings::show_settings).patch(settings::update_settings),
+        )
+        .route(
+            "/api/v1/merchant/settings/events",
+            post(settings::settings_events),
+        )
+        .route(
+            "/api/v1/payment_methods",
+            get(settings::payment_methods_index).post(settings::payment_methods_create),
+        )
+        .route(
+            "/api/v1/payment_methods/{id}",
+            patch(settings::payment_methods_update).delete(settings::payment_methods_destroy),
+        )
         .route("/api/v1/profile", patch(merchant::profile_update))
         .route(
             "/api/v1/categories",

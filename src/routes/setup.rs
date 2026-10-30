@@ -382,19 +382,85 @@ async fn issue_pairing_code(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>) -> App
 }
 
 fn lan_urls(bind: &str) -> Vec<String> {
-    let port = bind.rsplit(':').next().unwrap_or("8787");
-    let mut urls = vec![format!("http://127.0.0.1:{port}")];
-    if let Ok(ip) = detect_lan_ip() {
-        urls.push(format!("http://{ip}:{port}"));
+    let port = bind
+        .rsplit(':')
+        .next()
+        .filter(|p| p.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or("8787");
+    let mut urls = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for ip in lan_ipv4s() {
+        let url = format!("http://{ip}:{port}");
+        if seen.insert(url.clone()) {
+            urls.push(url);
+        }
+    }
+    // Localhost is only useful on this machine — keep it last as a fallback label.
+    let local = format!("http://127.0.0.1:{port}");
+    if seen.insert(local.clone()) {
+        urls.push(local);
     }
     urls
 }
 
-fn detect_lan_ip() -> Result<String, std::io::Error> {
-    use std::net::UdpSocket;
+fn lan_ipv4s() -> Vec<String> {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let usable = |ip: Ipv4Addr| -> bool {
+        !ip.is_unspecified()
+            && !ip.is_loopback()
+            && !ip.is_link_local()
+            && !ip.is_multicast()
+            && !ip.is_broadcast()
+            && ip.is_private()
+    };
+
+    let mut ips = Vec::new();
+    if let Ok(list) = local_ip_address::list_afinet_netifas() {
+        for (_name, addr) in list {
+            if let IpAddr::V4(v4) = addr {
+                if usable(v4) {
+                    let text = v4.to_string();
+                    if !ips.contains(&text) {
+                        ips.push(text);
+                    }
+                }
+            }
+        }
+    }
+    if ips.is_empty() {
+        if let Ok(IpAddr::V4(v4)) = local_ip_address::local_ip() {
+            if usable(v4) {
+                ips.push(v4.to_string());
+            }
+        }
+    }
+    if ips.is_empty() {
+        if let Ok(ip) = detect_lan_ip_udp() {
+            ips.push(ip);
+        }
+    }
+    ips
+}
+
+/// UDP route trick — only trust the result when connect succeeds and the IP is a real LAN address.
+fn detect_lan_ip_udp() -> Result<String, std::io::Error> {
+    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
     let socket = UdpSocket::bind("0.0.0.0:0")?;
-    let _ = socket.connect("8.8.8.8:80");
-    Ok(socket.local_addr()?.ip().to_string())
+    socket.connect("8.8.8.8:80")?;
+    match socket.local_addr()?.ip() {
+        IpAddr::V4(v4)
+            if !v4.is_unspecified()
+                && !v4.is_loopback()
+                && (v4.is_private() || v4 != Ipv4Addr::new(0, 0, 0, 0)) =>
+        {
+            Ok(v4.to_string())
+        }
+        other => Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("no usable LAN address from UDP probe ({other})"),
+        )),
+    }
 }
 
 async fn apply_seed(pool: &SqlitePool, seed: &Value) -> AppResult<()> {
